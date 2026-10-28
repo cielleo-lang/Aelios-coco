@@ -186,7 +186,7 @@ Anthropic token counting。使用这些额外端点的客户端需要后续适�
 主模型对话的原始新用户文本、可见助手回复和模型发出的工具调用（tool_use / function_call 参数）进入 messages 表，供 Dream 使用，无需 Hook。thinking、工具返回不入库。Chat Completions 记录第一个 choice。像「已回她」「已发送」这种回执整句丢掉——发出去的正文在对应工具参数里。旧回执读取时也会洗掉。
 `gateway_exchanges` 保存操作状态、实际模型/Provider 和可见文本，不保存注入补丁。
 
-写代码的客户端只记说的话（助手的 `codingFilter`，默认开，`false` 关掉回到全记）。请求头自报是 Claude Code、Codex、Cline、Roo、Kilo、opencode、Aider 等（`User-Agent`、`X-Title`、`HTTP-Referer`、`originator`），或请求同时带跑命令和改文件两类工具，就算写代码，响应带 `x-aelios-coding: <依据>`。这时：用户文本里的代码块换成 `[code]`；回复调用了读、跑、改代码的工具，这一步只留其他工具调用（比如发消息），什么都不剩就整步不记、不写 D1；没碰代码工具的回复照记，代码块同样换成 `[code]`。召回不变，只在用户开口的那轮做。判断在 `src/gateway/coding.ts`。
+写代码的客户端只记说的话（助手的 `codingFilter`，默认开，`false` 关掉回到全记）。请求头自报是 Claude Code、Codex、Cline、Roo、Kilo、opencode、Aider 等（`User-Agent`、`X-Title`、`HTTP-Referer`、`originator`），或请求同时带跑命令和改文件两类工具，就算写代码，响应带 `x-aelios-coding: <依据>`。这时：用户文本里的代码块换成 `[code]`（按 CommonMark，围栏要用同一种符号、不短于开头的那行才算关上）；回复只要调用了发消息以外的工具，这一步就只留发消息类的调用（工具名里有 send、reply、message、tts 之类的词，且没有 terminal、file、commit、pr 之类的词），其他工具一律当干活，参数不进记录，也不占 8000 字的上限；留下的发消息调用另算 8000 字上限，超了记成 truncated。正常完成、什么都不剩的步骤整步不记、不写 D1；失败、被截断、中途断开的照记状态。没调用工具的回复照记，代码块同样换成 `[code]`。召回不变，只在用户开口的那轮做，搜的词去掉了这一轮和前几轮里的代码。判断在 `src/gateway/coding.ts`。
 
 - 同一请求重试、Queue 重复投递：稳定指纹 + D1 主键去重。
 - 更长历史中再次说相同文字：视为新消息。

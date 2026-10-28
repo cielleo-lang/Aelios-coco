@@ -6,10 +6,13 @@ import type { Body } from "./protocol";
  * Each tool step is its own request, and what it carries is about the code, not the relationship.
  * So for a coding request the gateway records:
  *  - the person's words with code blocks replaced by [code];
- *  - a reply that touched no code tool, with code blocks replaced the same way;
- *  - from a step that read, ran or edited code, only its other tool calls (a message sent through a
- *    tool, say). A step left with nothing is not recorded at all, so it costs no D1 writes.
- * Recall is unchanged: it runs on the person's turns only, as for any client.
+ *  - a reply that called no work tool, with code blocks replaced the same way;
+ *  - from a step that called a work tool, only its speech tool calls (a message sent through a
+ *    tool). Work tools are every tool that is not speech, so tool names nobody listed stay out.
+ *    Their arguments never enter the record, so they cannot crowd out or outgrow the 8,000-character
+ *    cap. A finished step left with nothing is not recorded at all, so it costs no D1 writes; a
+ *    failed one is still recorded as failed.
+ * Recall still runs on the person's turns only, and searches without the code.
  * An assistant can switch this off with `codingFilter: false` to record everything as before.
  *
  * A request counts as coding when either signal is present:
@@ -26,11 +29,11 @@ const SHELL_TOOLS = new Set(["bash", "shell", "localshell", "executecommand", "r
 const EDIT_TOOLS = new Set(["edit", "multiedit", "write", "applypatch", "strreplaceeditor", "strreplacebasededittool",
   "texteditor", "writetofile", "replaceinfile", "editfile", "applydiff", "createfile", "insertcontent",
   "searchandreplace", "notebookedit", "writefile", "patch"]);
-/** Tools whose calls are about the code; a step that calls one is not conversation. */
-const CODE_TOOLS = new Set([...SHELL_TOOLS, ...EDIT_TOOLS, "read", "readfile", "view", "viewfile", "glob", "grep",
-  "grepsearch", "ls", "list", "listfiles", "listdir", "listdirectory", "searchfiles", "filesearch", "findfiles",
-  "codebasesearch", "notebookread", "bashoutput", "killbash", "killshell", "todowrite", "todoread", "updateplan",
-  "task", "lsp", "diagnostics"]);
+// A speech tool says something to someone: its name has one of these words and none of the second set
+// ("sendKeys" types into a terminal, "commit_message" writes to git).
+const SPEECH_WORDS = new Set(["send", "reply", "message", "messages", "msg", "notify", "speak", "say", "voice", "tts", "sticker", "dm"]);
+const NOT_SPEECH_WORDS = new Set(["key", "keys", "terminal", "shell", "bash", "exec", "command", "file", "files", "commit",
+  "log", "logs", "code", "pr", "pull", "issue", "input"]);
 
 function normalize(name: unknown): string {
   return typeof name === "string" ? name.toLowerCase().replace(/[^a-z0-9]/g, "").replace(/\d+$/, "") : "";
@@ -54,23 +57,31 @@ export function codingClient(headers: Headers, body: Body): string | null {
   return shell && edit ? `tools:${shell}+${edit}` : null;
 }
 
-export function isCodeTool(name: string): boolean {
-  return CODE_TOOLS.has(normalize(name));
+export function isSpeechTool(name: string): boolean {
+  const words = name.replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  return words.some(word => SPEECH_WORDS.has(word)) && !words.some(word => NOT_SPEECH_WORDS.has(word));
 }
 
-/** Fenced code blocks (``` or ~~~, closed or running to the end) become [code]; code alone leaves "". */
+/**
+ * Fenced code blocks become [code]; code alone leaves "". As in CommonMark, a block closes at a line
+ * of the same fence character at least as long as the opening one, or runs to the end.
+ */
 export function stripCodeBlocks(text: string): string {
   const said = text
-    .replace(/(^|\n)[ \t]*(`{3,}|~{3,})[^\n]*(?:(?:\n[\s\S]*?)?\n[ \t]*\2[ \t]*(?=\n|$)|[\s\S]*$)/g, "$1[code]")
+    .replace(/(^|\n)[ \t]*((`|~)\3{2,})[^\n]*(?:(?:\n[\s\S]*?)?\n[ \t]*\2\3*[ \t]*(?=\n|$)|[\s\S]*$)/g, "$1[code]")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
   return said.replaceAll("[code]", "").trim() ? said : "";
 }
 
-/** What a coding agent's reply said, for the record (see the header). */
-export function codingSpeech(out: { text: string; tools: Array<{ name: string; line: string }> }): string {
-  if (out.tools.some(tool => isCodeTool(tool.name))) {
-    return out.tools.filter(tool => !isCodeTool(tool.name)).map(tool => tool.line).join("\n");
-  }
-  return stripCodeBlocks(out.text);
+/** The words to search memories with: no code, no placeholders. */
+export function recallWords(text: string): string {
+  return stripCodeBlocks(text).replaceAll("[code]", " ").replace(/\s+/g, " ").trim();
+}
+
+/** What a coding agent's reply said, for the record (see the header), and whether it hit the cap. */
+export function codingSpeech(out: { text: string; truncated: boolean; overflow: boolean; workCalls: number;
+  spoken: string; spokenTruncated: boolean }): { text: string; truncated: boolean } {
+  if (out.workCalls) return { text: out.spoken, truncated: out.overflow || out.spokenTruncated };
+  return { text: stripCodeBlocks(out.text), truncated: out.truncated };
 }

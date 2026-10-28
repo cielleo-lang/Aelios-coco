@@ -12,7 +12,7 @@ import { getOrCreateConversation } from "../src/db/conversations";
 import { saveUserMessages } from "../src/db/messages";
 
 import { lexicalOverlapScore, shapeRecallQuery } from "../src/memory/queryShape";
-import { codingClient, codingSpeech, stripCodeBlocks } from "../src/gateway/coding";
+import { codingClient, codingSpeech, isSpeechTool, stripCodeBlocks } from "../src/gateway/coding";
 
 // Test production modules and SQL with deterministic HTTP and Workers AI doubles.
 (crypto.subtle as any).timingSafeEqual = (a: Uint8Array, b: Uint8Array) => timingSafeEqual(a, b);
@@ -1406,10 +1406,19 @@ test("coding speech keeps words, turns code blocks into [code] and drops code st
   assert.equal(stripCodeBlocks("先看：\n~~~py\nprint(1)\n没关上"), "先看：\n[code]");
   assert.equal(stripCodeBlocks("行内 `code` 不动"), "行内 `code` 不动");
   assert.equal(stripCodeBlocks("```\nonly code\n```"), "");
-  assert.equal(codingSpeech({ text: "Let me read it.\nRead {}", tools: [{ name: "Read", line: "Read {}" }] }), "");
-  assert.equal(codingSpeech({ text: "我去发\nweixin_send {}\nexec {}", tools: [{ name: "weixin_send", line: "weixin_send {\"text\":\"晚安\"}" }, { name: "exec", line: "exec {}" }] }),
-    "weixin_send {\"text\":\"晚安\"}");
-  assert.equal(codingSpeech({ text: "改好了。\n```\nx\n```", tools: [] }), "改好了。\n[code]");
+  const said = (content: unknown[]) => {
+    const out = new OutputCollector("messages", true);
+    out.json({ content, stop_reason: "tool_use" });
+    out.finish();
+    return codingSpeech(out).text;
+  };
+  assert.equal(said([{ type: "text", text: "Let me read it." }, { type: "tool_use", name: "Read", input: { file_path: "a.ts" } }]), "");
+  assert.equal(said([{ type: "text", text: "我去发" }, { type: "tool_use", name: "weixin_send", input: { text: "晚安" } },
+    { type: "tool_use", name: "exec", input: { command: "ls" } }]), "weixin_send {\"text\":\"晚安\"}");
+  assert.equal(said([{ type: "text", text: "改好了。\n```\nx\n```" }]), "改好了。\n[code]");
+  // Speech is a word in the name, and words about terminals, files or git rule it out.
+  for (const name of ["weixin_send", "send_message", "sendMessage", "reply", "tts_speak", "send_sticker"]) assert.ok(isSpeechTool(name), name);
+  for (const name of ["sendKeys", "commit_message", "Read", "mcp__github__create_pull_request", "log_message", "send_file"]) assert.ok(!isSpeechTool(name), name);
 });
 
 test("coding agents are recorded as conversation only, unless the assistant turns the filter off", async () => {
@@ -1446,4 +1455,49 @@ test("coding agents are recorded as conversation only, unless the assistant turn
     assert.equal(queue.length, 3); assert.match(queue[2].assistantText, /Edit/);
   } finally { globalThis.fetch = mock; }
   assert.throws(() => validateConfig({ ...config(), identities: [{ ...identity(), codingFilter: "yes" }] }), /codingFilter/);
+});
+
+test("coding filter: code tool arguments neither crowd out nor smuggle in what is kept", async () => {
+  const mock = globalThis.fetch;
+  let reply: any;
+  globalThis.fetch = async (url: any, init: any) => {
+    calls.push({ url: String(url), headers: Object.fromEntries(new Headers(init?.headers)), query: JSON.parse(init?.body as string) });
+    return typeof reply === "function" ? reply() : Response.json({ model: "claude-test", ...reply });
+  };
+  const claudeCode = { "user-agent": "claude-cli/2.1.0 (external, cli)" };
+  const ask = { role: "user", content: "帮我改一下" };
+  const loop = (n: number) => [ask, { role: "assistant", content: [{ type: "tool_use", id: `t${n}`, name: "Read", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: `t${n}`, content: "ok" }] }];
+  const step = async (n: number) => { const before = queue.length;
+    await run("/v1/messages", { model: "partner", max_tokens: 64, messages: loop(n) }, claudeCode);
+    return queue.length > before ? queue.at(-1) : null; };
+  try {
+    // A huge edit next to a message: the message is kept whole, not lost to the 8,000-character cap.
+    reply = { content: [{ type: "tool_use", id: "e", name: "Edit", input: { new_string: "x".repeat(9000) } },
+      { type: "tool_use", id: "w", name: "weixin_send", input: { text: "晚安" } }], stop_reason: "tool_use" };
+    let kept = await step(1);
+    assert.ok(kept); assert.equal(kept.completion, "complete"); assert.match(kept.assistantText, /晚安/); assert.doesNotMatch(kept.assistantText, /xxxx/);
+    // A huge kept call is still held to the cap.
+    reply = { content: [{ type: "tool_use", id: "w", name: "weixin_send", input: { text: "长".repeat(9000) } },
+      { type: "tool_use", id: "r", name: "Read", input: {} }], stop_reason: "tool_use" };
+    kept = await step(2);
+    assert.ok(kept); assert.ok(kept.assistantText.length <= 8000); assert.equal(kept.completion, "truncated");
+    // Tool names nobody listed are not speech either.
+    reply = { content: [{ type: "text", text: "我开个 PR。" }, { type: "tool_use", id: "g", name: "mcp__github__create_pull_request", input: { body: "diff --git a/x b/x" } }], stop_reason: "tool_use" };
+    assert.equal(await step(3), null);
+    // A failed step is still recorded as failed, for diagnosis.
+    reply = () => Response.json({ type: "error", error: { type: "api_error", message: "boom" } }, { status: 500 });
+    kept = await step(4);
+    assert.equal(kept?.completion, "failed");
+  } finally { globalThis.fetch = mock; }
+});
+
+test("coding filter: a longer closing fence ends the block, and earlier code stays out of recall", async () => {
+  assert.equal(stripCodeBlocks("看：\n```\ncode\n````\n后面的话"), "看：\n[code]\n后面的话");
+  assert.equal(stripCodeBlocks("看：\n````\n```\n还在块里\n````\n后面"), "看：\n[code]\n后面");
+  precious("partner-a", "量子猫咪是暗号");
+  await run("/v1/chat/completions", { model: "partner", messages: [
+    { role: "user", content: "看这个\n```\n量子猫咪\n```" }, { role: "assistant", content: "嗯" }, { role: "user", content: "好了吗" }] },
+  { "user-agent": "claude-cli/2.1.0 (external, cli)" });
+  assert.doesNotMatch(JSON.stringify(calls.at(-1).query.messages.at(-1)), /量子猫咪是暗号/);
 });

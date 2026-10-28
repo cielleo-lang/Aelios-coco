@@ -4,6 +4,7 @@ import { captureRememberNow } from "../memory/rememberNow";
 import { sha256Hex } from "../utils/hash";
 import { getSseData, splitSseEvents } from "../utils/sseParser";
 import { cleanMessageText } from "../utils/sanitize";
+import { isSpeechTool } from "./coding";
 import { identityNamespace, object, type Identity, type Protocol } from "./config";
 import { canonical, inputItems, visibleText, type Body, type Turn } from "./protocol";
 
@@ -164,27 +165,37 @@ function coerceToolInput(input: unknown): unknown {
 
 export class OutputCollector {
   text = "";
-  /** Every tool call the model made, in order; `text` carries the same lines inline. */
-  tools: Array<{ name: string; line: string }> = [];
   complete = false;
   failed = false;
   truncated = false;
+  /** The output outgrew what the gateway buffers, so part of it was never seen. */
+  overflow = false;
+  /** Coding mode only: work tool calls (left out of `text`), and the speech tool calls on their own. */
+  workCalls = 0;
+  spoken = "";
+  spokenTruncated = false;
   model = "";
   private rest = "";
   private decoder = new TextDecoder();
   private pending = new Map<number, { name: string; json: string }>();
   private chatTools = new Map<number, { name: string; json: string }>();
   private sealed = false;
-  constructor(readonly protocol: Protocol) {}
+  constructor(readonly protocol: Protocol, readonly coding = false) {}
   private append(text: unknown): void {
     if (typeof text !== "string") return;
     if (this.text.length + text.length > TEXT_LIMIT) this.truncated = true;
     this.text = (this.text + text).slice(0, TEXT_LIMIT);
   }
   private appendTool(name: string, input: unknown): void {
+    // A coding agent's work tools carry code: count them, never keep their arguments.
+    if (this.coding && !isSpeechTool(String(name || ""))) { this.workCalls += 1; return; }
     const line = formatToolCall(name, input);
     if (!line) return;
-    this.tools.push({ name, line });
+    if (this.coding) {
+      const spoken = this.spoken ? `${this.spoken}\n${line}` : line;
+      if (spoken.length > TEXT_LIMIT) this.spokenTruncated = true;
+      this.spoken = spoken.slice(0, TEXT_LIMIT);
+    }
     if (this.text && !this.text.endsWith("\n")) this.append("\n");
     this.append(`${line}\n`);
   }
@@ -237,7 +248,7 @@ export class OutputCollector {
     const parsed = splitSseEvents(this.rest + this.decoder.decode(bytes, { stream: true }));
     this.rest = parsed.rest;
     for (const event of parsed.events) this.event(event);
-    if (this.rest.length > 128000) { this.rest = ""; this.truncated = true; }
+    if (this.rest.length > 128000) { this.rest = ""; this.truncated = true; this.overflow = true; }
   }
   private event(event: string): void {
     const raw = getSseData(event);
@@ -290,7 +301,9 @@ export class OutputCollector {
         const streamed = this.text;
         this.pending.clear();
         this.text = "";
-        this.tools = [];
+        this.workCalls = 0;
+        this.spoken = "";
+        this.spokenTruncated = false;
         this.json(data.response);
         if (!this.text) this.text = streamed;
       }
@@ -304,14 +317,15 @@ export class OutputCollector {
     if (this.sealed) return;
     this.sealed = true;
     this.text = cleanMessageText(this.text);
+    this.spoken = cleanMessageText(this.spoken);
   }
 }
 
 export function observeResponse(upstream: Response, protocol: Protocol, ctx: ExecutionContext,
-  onFinish: (collector: OutputCollector, interrupted: boolean) => Promise<void>): Response {
+  onFinish: (collector: OutputCollector, interrupted: boolean) => Promise<void>, coding = false): Response {
   if (!upstream.body) return upstream;
   const reader = upstream.body.getReader();
-  const collector = new OutputCollector(protocol);
+  const collector = new OutputCollector(protocol, coding);
   const sse = upstream.headers.get("content-type")?.includes("text/event-stream");
   const decoder = new TextDecoder();
   let json = "";
@@ -338,7 +352,7 @@ export function observeResponse(upstream: Response, protocol: Protocol, ctx: Exe
           if (sse) collector.chunk(item.value);
           else if (!collector.truncated) {
             json += decoder.decode(item.value, { stream: true });
-            if (json.length > 256000) { collector.truncated = true; json = ""; }
+            if (json.length > 256000) { collector.truncated = true; collector.overflow = true; json = ""; }
           }
         } catch { collector.failed = true; }
         controller.enqueue(item.value);

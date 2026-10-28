@@ -10,7 +10,7 @@ import type { Env } from "../types";
 import { newId } from "../utils/ids";
 import { nowIso } from "../utils/time";
 import { cleanMessageText } from "../utils/sanitize";
-import { codingClient, codingSpeech, stripCodeBlocks } from "./coding";
+import { codingClient, codingSpeech, recallWords, stripCodeBlocks } from "./coding";
 import { findIdentity, identityNamespace, identityReadNamespaces, isMainModel, loadConfig, type GatewayConfig, type Identity, type Protocol } from "./config";
 import { appendMemory, classifyTurn, hasServerState, inputItems, recentHumanTexts, validateBody, visibleText, type Body } from "./protocol";
 import { RequestContractError } from "./request";
@@ -250,9 +250,10 @@ export async function handleGateway(request: Request, env: Env, ctx: ExecutionCo
   }
   if (main && turn.kind === "human" && turn.text) {
     try {
-      const prior = recentHumanTexts(body, protocol).slice(0, -1).slice(-3);
-      // The [code] placeholders are for the record, not words to search memories with.
-      patch = await recallPatch(env, identity, coding ? turn.text.replaceAll("[code]", " ") : turn.text, ctx, prior, {
+      // A coding agent's code is not words to search memories with, in this turn or the ones before.
+      const prior = recentHumanTexts(body, protocol).slice(0, -1).slice(-3)
+        .map(text => coding ? recallWords(text) : text).filter(Boolean);
+      patch = await recallPatch(env, identity, coding ? recallWords(turn.text) : turn.text, ctx, prior, {
         excludeMessageIds: exchange ? [exchange.userId] : [],
         recallId,
         // A quote still present in this request's history is visible; recalling it
@@ -291,15 +292,18 @@ export async function handleGateway(request: Request, env: Env, ctx: ExecutionCo
       return response;
     }
     return observeResponse(response, protocol, ctx, async (out, interrupted) => {
-      exchange.assistantText = coding ? codingSpeech(out) : out.text;
+      const said = coding ? codingSpeech(out) : out;
+      exchange.assistantText = said.text;
       if (out.model) exchange.model = out.model;
       exchange.completion = !upstream.ok || out.failed ? "failed" :
-        out.truncated || exchange.completion === "truncated" ? "truncated" :
+        said.truncated || exchange.completion === "truncated" ? "truncated" :
         interrupted || !out.complete ? "incomplete" : "complete";
-      // A coding step that only read, ran or edited code leaves nothing to keep: skip the write.
-      if (coding && exchange.kind !== "human" && !cleanMessageText(exchange.assistantText)) return;
+      // A finished coding step that only worked on code leaves nothing to keep: skip the write.
+      // Failed, cut-off and interrupted steps are still recorded with their status.
+      if (coding && exchange.kind !== "human" && exchange.completion === "complete" &&
+          !cleanMessageText(exchange.assistantText)) return;
       await dispatchExchange(env, exchange);
-    });
+    }, Boolean(coding));
   } catch (error) {
     console.error("gateway upstream error", error);
     if (exchange) {
