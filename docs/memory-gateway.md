@@ -186,6 +186,8 @@ Anthropic token counting。使用这些额外端点的客户端需要后续适�
 主模型对话的原始新用户文本、可见助手回复和模型发出的工具调用（tool_use / function_call 参数）进入 messages 表，供 Dream 使用，无需 Hook。thinking、工具返回不入库。Chat Completions 记录第一个 choice。像「已回她」「已发送」这种回执整句丢掉——发出去的正文在对应工具参数里。旧回执读取时也会洗掉。
 `gateway_exchanges` 保存操作状态、实际模型/Provider 和可见文本，不保存注入补丁。
 
+写代码的客户端只记说的话（助手的 `codingFilter`，默认开，`false` 关掉回到全记）。请求头自报是 Claude Code、Codex、Cline、Roo、Kilo、opencode、Aider 等（`User-Agent`、`X-Title`、`HTTP-Referer`、`originator`），或请求同时带跑命令和改文件两类工具，就算写代码，响应带 `x-aelios-coding: <依据>`。这时：用户文本里的代码块换成 `[code]`（按 CommonMark，围栏要用同一种符号、不短于开头的那行才算关上）；回复的文字边流边把代码块换成 `[code]`，所以再长的代码块也不会把后面的话挤出 8000 字的上限。回复只要调用了发消息以外的工具，这一步就只留发消息类的调用：工具名得有 send、reply、message、tts 之类的词，其余的词只能是发给谁、发到哪（user、chat、weixin、telegram 之类，MCP 的服务名不算），所以 `send_patch`、`sendKeys`、`commit_message` 都算干活；发消息参数里的代码块也换成 `[code]`。干活的工具参数不进记录，也不占 8000 字上限；留下的发消息调用另算 8000 字上限，超了记成 truncated。流式工具参数每个最多攒 64000 字。正常完成、什么都不剩的步骤不加新行，只把同一请求之前失败的那次改成完成（按主键查一行，平时不写）；失败、被截断、中途断开的立刻写入、不走队列，好让紧跟着的重试找得到。没调用工具的回复照记。召回不变，只在用户开口的那轮做，搜的词去掉了这一轮和前几轮里的代码。判断在 `src/gateway/coding.ts`。
+
 - 同一请求重试、Queue 重复投递：稳定指纹 + D1 主键去重。
 - 更长历史中再次说相同文字：视为新消息。
 - 每个输入/输出记录最多 8000 字符，超限为 truncated，不把截断对话当作完整 Dream 来源。

@@ -13,6 +13,7 @@ import { saveUserMessages } from "../src/db/messages";
 import { backfillFts } from "../src/memory/fts";
 
 import { lexicalOverlapScore, shapeRecallQuery } from "../src/memory/queryShape";
+import { codingClient, codingSpeech, isSpeechTool, stripCodeBlocks } from "../src/gateway/coding";
 
 // Test production modules and SQL with deterministic HTTP and Workers AI doubles.
 (crypto.subtle as any).timingSafeEqual = (a: Uint8Array, b: Uint8Array) => timingSafeEqual(a, b);
@@ -1416,4 +1417,165 @@ test("the model list marks which models get memory under the asking identity; ot
   // The same list under the other identity, reached by its path with the key it allows.
   assert.deepEqual(await mark("/other/v1/models", { authorization: "Bearer im-key" }), {
     "anthropic/claude-opus-4-5": false, partner: false, "chatgpt/gpt-5": true, "openrouter/openai/gpt-6.1-sol:floor": true, "custom-mine/tiny": false });
+});
+
+test("codingClient knows coding agents by header or by shell plus edit tools", () => {
+  const h = (init: Record<string, string>) => new Headers(init);
+  assert.equal(codingClient(h({ "user-agent": "claude-cli/2.1.0 (external, cli)" }), {}), "client:claude-cli");
+  assert.equal(codingClient(h({ originator: "codex_cli_rs", "user-agent": "codex_cli_rs/0.50.0" }), {}), "client:codex");
+  assert.equal(codingClient(h({ "x-title": "Cline", "http-referer": "https://cline.bot" }), {}), "client:cline");
+  assert.equal(codingClient(h({ "x-title": "Roo Code" }), {}), "client:roo code");
+  assert.equal(codingClient(h({ "user-agent": "opencode/0.15.0" }), {}), "client:opencode");
+  // Messages, Chat Completions and Responses tool shapes, including Anthropic's versioned server tools.
+  assert.equal(codingClient(h({}), { tools: [{ name: "Bash" }, { name: "Read" }, { name: "Edit" }] }), "tools:bash+edit");
+  assert.equal(codingClient(h({}), { tools: [{ type: "bash_20250124", name: "bash" }, { type: "text_editor_20250728", name: "str_replace_based_edit_tool" }] }), "tools:bash+strreplacebasededittool");
+  assert.equal(codingClient(h({}), { tools: [{ type: "function", function: { name: "execute_command" } }, { type: "function", function: { name: "replace_in_file" } }] }), "tools:executecommand+replaceinfile");
+  assert.equal(codingClient(h({}), { tools: [{ type: "local_shell" }, { type: "custom", name: "apply_patch" }] }), "tools:localshell+applypatch");
+  // A companion app: chat UAs, memory and web tools, or only one of the two kinds.
+  assert.equal(codingClient(h({ "user-agent": "Mozilla/5.0 Chatbox/1.15" }), { tools: [{ name: "web_search" }, { name: "memory_recall" }, { name: "write_diary" }] }), null);
+  assert.equal(codingClient(h({ "user-agent": "Anthropic/JS 0.60.0" }), { tools: [{ name: "bash" }, { name: "read" }] }), null);
+  assert.equal(codingClient(h({}), {}), null);
+});
+
+test("coding speech keeps words, turns code blocks into [code] and drops code steps", () => {
+  assert.equal(stripCodeBlocks("改成这样：\n```ts\nconst a = 1;\n```\n好了"), "改成这样：\n[code]\n好了");
+  assert.equal(stripCodeBlocks("先看：\n~~~py\nprint(1)\n没关上"), "先看：\n[code]");
+  assert.equal(stripCodeBlocks("行内 `code` 不动"), "行内 `code` 不动");
+  assert.equal(stripCodeBlocks("```\nonly code\n```"), "");
+  const said = (content: unknown[]) => {
+    const out = new OutputCollector("messages", true);
+    out.json({ content, stop_reason: "tool_use" });
+    out.finish();
+    return codingSpeech(out).text;
+  };
+  assert.equal(said([{ type: "text", text: "Let me read it." }, { type: "tool_use", name: "Read", input: { file_path: "a.ts" } }]), "");
+  assert.equal(said([{ type: "text", text: "我去发" }, { type: "tool_use", name: "weixin_send", input: { text: "晚安" } },
+    { type: "tool_use", name: "exec", input: { command: "ls" } }]), "weixin_send {\"text\":\"晚安\"}");
+  assert.equal(said([{ type: "text", text: "改好了。\n```\nx\n```" }]), "改好了。\n[code]");
+  // A speech tool's name is speech words and where they go, nothing else; MCP server names are not judged.
+  for (const name of ["weixin_send", "send_message", "sendMessage", "reply", "tts_speak", "send_sticker", "mcp__weixin__send_message", "send_message_v2"]) assert.ok(isSpeechTool(name), name);
+  for (const name of ["sendKeys", "commit_message", "Read", "mcp__github__create_pull_request", "log_message", "send_file", "send_patch", "AskUserQuestion"]) assert.ok(!isSpeechTool(name), name);
+});
+
+test("coding agents are recorded as conversation only, unless the assistant turns the filter off", async () => {
+  const mock = globalThis.fetch;
+  let reply: any = { content: [{ type: "text", text: "我先看看。" }, { type: "tool_use", id: "r", name: "Read", input: { file_path: "/src/a.ts" } }], stop_reason: "tool_use" };
+  globalThis.fetch = async (url: any, init: any) => {
+    calls.push({ url: String(url), headers: Object.fromEntries(new Headers(init?.headers)), query: JSON.parse(init?.body as string) });
+    return Response.json({ model: "claude-test", ...reply });
+  };
+  const claudeCode = { "user-agent": "claude-cli/2.1.0 (external, cli)" };
+  const ask = { role: "user", content: "老公帮我把按钮改蓝\n```css\n.btn { color: red }\n```" };
+  const step = { role: "assistant", content: reply.content };
+  const result = { role: "user", content: [{ type: "tool_result", tool_use_id: "r", content: ".btn { color: red }" }] };
+  try {
+    // Her turn: recorded without the code, and the reply's file read is not.
+    let out = await run("/v1/messages", { model: "partner", max_tokens: 64, messages: [ask] }, claudeCode);
+    assert.equal(out.response.headers.get("x-aelios-coding"), "client:claude-cli");
+    assert.equal((sqlite.prepare("SELECT content FROM messages WHERE role = 'user'").get() as any).content, "老公帮我把按钮改蓝\n[code]");
+    assert.equal(queue.length, 1); assert.equal(queue[0].assistantText, "");
+    // A step that only edits code: nothing dispatched at all.
+    reply = { content: [{ type: "tool_use", id: "e", name: "Edit", input: { old_string: "red", new_string: "blue" } }], stop_reason: "tool_use" };
+    out = await run("/v1/messages", { model: "partner", max_tokens: 64, messages: [ask, step, result] }, claudeCode);
+    assert.equal(out.response.status, 200);
+    assert.equal(queue.length, 1);
+    // The closing reply is conversation and is kept, code and all turned into [code].
+    reply = { content: [{ type: "text", text: "改好了，现在是蓝色。\n```css\n.btn { color: blue }\n```" }], stop_reason: "end_turn" };
+    await run("/v1/messages", { model: "partner", max_tokens: 64, messages: [ask, step, result] }, claudeCode);
+    assert.equal(queue.length, 2); assert.equal(queue[1].assistantText, "改好了，现在是蓝色。\n[code]");
+    // Filter off: the old behaviour, everything recorded.
+    setConfig(config([{ ...identity(), codingFilter: false } as ReturnType<typeof identity>]));
+    reply = { content: [{ type: "tool_use", id: "e", name: "Edit", input: { old_string: "red", new_string: "blue" } }], stop_reason: "tool_use" };
+    out = await run("/v1/messages", { model: "partner", max_tokens: 64, messages: [ask, step, result] }, claudeCode);
+    assert.equal(out.response.headers.get("x-aelios-coding"), null);
+    assert.equal(queue.length, 3); assert.match(queue[2].assistantText, /Edit/);
+  } finally { globalThis.fetch = mock; }
+  assert.throws(() => validateConfig({ ...config(), identities: [{ ...identity(), codingFilter: "yes" }] }), /codingFilter/);
+});
+
+test("coding filter: code tool arguments neither crowd out nor smuggle in what is kept", async () => {
+  const mock = globalThis.fetch;
+  let reply: any;
+  globalThis.fetch = async (url: any, init: any) => {
+    calls.push({ url: String(url), headers: Object.fromEntries(new Headers(init?.headers)), query: JSON.parse(init?.body as string) });
+    return typeof reply === "function" ? reply() : Response.json({ model: "claude-test", ...reply });
+  };
+  const claudeCode = { "user-agent": "claude-cli/2.1.0 (external, cli)" };
+  const ask = { role: "user", content: "帮我改一下" };
+  const loop = (n: number) => [ask, { role: "assistant", content: [{ type: "tool_use", id: `t${n}`, name: "Read", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: `t${n}`, content: "ok" }] }];
+  const step = async (n: number) => { const before = queue.length;
+    await run("/v1/messages", { model: "partner", max_tokens: 64, messages: loop(n) }, claudeCode);
+    return queue.length > before ? queue.at(-1) : null; };
+  try {
+    // A huge edit next to a message: the message is kept whole, not lost to the 8,000-character cap.
+    reply = { content: [{ type: "tool_use", id: "e", name: "Edit", input: { new_string: "x".repeat(9000) } },
+      { type: "tool_use", id: "w", name: "weixin_send", input: { text: "晚安" } }], stop_reason: "tool_use" };
+    let kept = await step(1);
+    assert.ok(kept); assert.equal(kept.completion, "complete"); assert.match(kept.assistantText, /晚安/); assert.doesNotMatch(kept.assistantText, /xxxx/);
+    // A huge kept call is still held to the cap.
+    reply = { content: [{ type: "tool_use", id: "w", name: "weixin_send", input: { text: "长".repeat(9000) } },
+      { type: "tool_use", id: "r", name: "Read", input: {} }], stop_reason: "tool_use" };
+    kept = await step(2);
+    assert.ok(kept); assert.ok(kept.assistantText.length <= 8000); assert.equal(kept.completion, "truncated");
+    // Tool names nobody listed are not speech either.
+    reply = { content: [{ type: "text", text: "我开个 PR。" }, { type: "tool_use", id: "g", name: "mcp__github__create_pull_request", input: { body: "diff --git a/x b/x" } }], stop_reason: "tool_use" };
+    assert.equal(await step(3), null);
+    // A failed step is still recorded as failed, for diagnosis, and its retry closes it.
+    const status = () => (sqlite.prepare("SELECT completion_status AS s FROM gateway_exchanges WHERE profile = 'partner' ORDER BY created_at DESC LIMIT 1").get() as any)?.s;
+    reply = () => Response.json({ type: "error", error: { type: "api_error", message: "boom" } }, { status: 500 });
+    assert.equal(await step(4), null);
+    assert.equal(status(), "failed");
+    reply = { content: [{ type: "tool_use", id: "r", name: "Read", input: {} }], stop_reason: "tool_use" };
+    assert.equal(await step(4), null);
+    assert.equal(status(), "complete"); assert.equal(count("gateway_exchanges"), 1);
+    // A long code block does not push the words after it out of the cap.
+    reply = { content: [{ type: "text", text: `改好了：\n\`\`\`ts\n${"x".repeat(9000)}\n\`\`\`\nDone` }], stop_reason: "end_turn" };
+    kept = await step(5);
+    assert.ok(kept); assert.equal(kept.completion, "complete"); assert.equal(kept.assistantText, "改好了：\n[code]\nDone");
+    // Speech tools are names made only of speech words, and code inside what they say becomes [code].
+    reply = { content: [{ type: "tool_use", id: "p", name: "send_patch", input: { patch: "diff --git a/x b/x" } },
+      { type: "tool_use", id: "r", name: "Read", input: {} }], stop_reason: "tool_use" };
+    assert.equal(await step(6), null);
+    reply = { content: [{ type: "tool_use", id: "m", name: "mcp__weixin__send_message", input: { text: "看这个\n```js\nconst a = 1\n```\n好吧" } },
+      { type: "tool_use", id: "r", name: "Read", input: {} }], stop_reason: "tool_use" };
+    kept = await step(7);
+    assert.ok(kept); assert.match(kept.assistantText, /\[code\]/); assert.doesNotMatch(kept.assistantText, /const a/);
+  } finally { globalThis.fetch = mock; }
+});
+
+test("coding filter: streamed code is dropped as it arrives, and streamed tool arguments are bounded", () => {
+  const sse = (events: unknown[]) => new TextEncoder().encode(events.map(e => `data: ${JSON.stringify(e)}\n\n`).join(""));
+  const text = (t: string) => ({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: t } });
+  const out = new OutputCollector("messages", true);
+  out.chunk(sse([{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }, text("看：\n`"), text("``t"), text("s\n")]));
+  for (let i = 0; i < 20; i++) out.chunk(sse([text("y".repeat(1000))]));
+  out.chunk(sse([text("\n``"), text("`\n好了"), { type: "message_delta", delta: { stop_reason: "end_turn" } }, { type: "message_stop" }]));
+  out.finish();
+  assert.deepEqual(codingSpeech(out), { text: "看：\n[code]\n好了", truncated: false });
+  // A huge streamed edit is not held in memory, and does not mark a coding step cut off.
+  const big = new OutputCollector("messages", true);
+  big.chunk(sse([{ type: "content_block_start", index: 1, content_block: { type: "tool_use", name: "Write" } }]));
+  for (let i = 0; i < 100; i++) big.chunk(sse([{ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "z".repeat(1000) } }]));
+  assert.ok((big as any).pending.get(1).json.length <= 64000);
+  big.chunk(sse([{ type: "content_block_stop", index: 1 }, { type: "message_stop" }]));
+  big.finish();
+  assert.deepEqual(codingSpeech(big), { text: "", truncated: false });
+  // Outside coding mode the same call is kept up to the cap and marked cut off.
+  const plain = new OutputCollector("messages");
+  plain.chunk(sse([{ type: "content_block_start", index: 1, content_block: { type: "tool_use", name: "Write" } }]));
+  for (let i = 0; i < 100; i++) plain.chunk(sse([{ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "z".repeat(1000) } }]));
+  plain.chunk(sse([{ type: "content_block_stop", index: 1 }, { type: "message_stop" }]));
+  plain.finish();
+  assert.ok(plain.truncated); assert.ok(plain.text.length <= 8000);
+});
+
+test("coding filter: a longer closing fence ends the block, and earlier code stays out of recall", async () => {
+  assert.equal(stripCodeBlocks("看：\n```\ncode\n````\n后面的话"), "看：\n[code]\n后面的话");
+  assert.equal(stripCodeBlocks("看：\n````\n```\n还在块里\n````\n后面"), "看：\n[code]\n后面");
+  precious("partner-a", "量子猫咪是暗号");
+  await run("/v1/chat/completions", { model: "partner", messages: [
+    { role: "user", content: "看这个\n```\n量子猫咪\n```" }, { role: "assistant", content: "嗯" }, { role: "user", content: "好了吗" }] },
+  { "user-agent": "claude-cli/2.1.0 (external, cli)" });
+  assert.doesNotMatch(JSON.stringify(calls.at(-1).query.messages.at(-1)), /量子猫咪是暗号/);
 });

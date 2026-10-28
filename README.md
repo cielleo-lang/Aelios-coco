@@ -77,6 +77,8 @@ https://<your Worker address>/coder/v1
 
 Only registered primary models get memory. Unregistered models (like the small utility models inside Claude Code) just pass through — nothing is recorded or recalled for them.
 
+When you code with tools such as Claude Code, Codex or Cline, Aelios keeps only what was said: code blocks are saved as `[code]`, and steps that read, run or edit code are not saved. To save everything, open the assistant's "Recall spaces, thinking blocks, size limit, coding filter" and turn off "When coding, keep only what was said".
+
 ### 3. Point your client at it
 
 Use `CHATBOX_API_KEY` as the API key everywhere. Write model names as `vendor/model`, e.g. `anthropic/claude-opus-4-5`.
