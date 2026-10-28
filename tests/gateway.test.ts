@@ -10,6 +10,7 @@ import { catalogUrl, nativeAnthropic, resolveUpstream, routeFor, rejectedToolFie
 import { OutputCollector, observeResponse, persistExchange, prepareExchange, dispatchExchange } from "../src/gateway/record";
 import { getOrCreateConversation } from "../src/db/conversations";
 import { saveUserMessages } from "../src/db/messages";
+import { backfillFts } from "../src/memory/fts";
 
 import { lexicalOverlapScore, shapeRecallQuery } from "../src/memory/queryShape";
 
@@ -110,6 +111,41 @@ test("migrations, native chat recall, namespace isolation, original text and Que
   await run("/v1/chat/completions", continuation);
   assert.deepEqual(calls[1].query.messages, continuation.messages);
   assert.equal(queue[1].kind, "tool"); assert.equal(queue[1].userText, "");
+});
+
+// message_id is UNINDEXED in FTS5: `DELETE FROM message_fts WHERE message_id = ?` reads the whole
+// table, and D1 bills every row. Recording a turn must not pay that on every request.
+function spySql(): string[] {
+  const seen: string[] = [];
+  const base = env.DB;
+  env.DB = { ...base, prepare(sql: string) { seen.push(sql); return base.prepare(sql); } };
+  return seen;
+}
+const ftsScans = (seen: string[]) => seen.filter(sql => /DELETE FROM (message|memory)_fts WHERE (message|memory)_id = \?/.test(sql));
+
+test("recording a turn indexes each new message once without scanning the FTS table", async () => {
+  const seen = spySql();
+  await run("/v1/chat/completions", { model: "partner", messages: [{ role: "user", content: "今晚想吃火锅" }] });
+  await persistExchange(env, queue[0]); await persistExchange(env, queue[0]);
+  assert.deepEqual(ftsScans(seen), []);
+  const indexed = (sqlite.prepare("SELECT message_id FROM message_fts").all() as any[]).map(row => row.message_id).sort();
+  assert.deepEqual(indexed, [queue[0].userId, `${queue[0].id}:assistant`].sort());
+});
+
+test("FTS backfill indexes missing rows without per-row FTS scans", async () => {
+  sqlite.prepare("INSERT INTO conversations (id, namespace, created_at, updated_at) VALUES ('c', 'partner-a', 'x', 'x')").run();
+  for (const [id, content] of [["m-old", "已经有索引的话"], ["m-new", "还没有索引的话"]]) {
+    sqlite.prepare(`INSERT INTO messages (id, conversation_id, namespace, role, content, source, stream, created_at, seq)
+      VALUES (?, 'c', 'partner-a', 'user', ?, 'test', 0, '2026-10-28T00:00:00.000Z', 0)`).run(id, content);
+  }
+  sqlite.prepare("INSERT INTO message_fts (fts_body, namespace, message_id) VALUES ('已经', 'partner-a', 'm-old')").run();
+  const seen = spySql();
+  const result = await backfillFts(env.DB, { namespace: "partner-a", limit: 10 });
+  assert.equal(result.messagesIndexed, 1);
+  assert.deepEqual(ftsScans(seen), []);
+  assert.ok(seen.every(sql => !/LEFT JOIN (message|memory)_fts/.test(sql)));
+  const ids = (sqlite.prepare("SELECT message_id FROM message_fts").all() as any[]).map(row => row.message_id).sort();
+  assert.deepEqual(ids, ["m-new", "m-old"]);
 });
 
 function seedQuote(namespace: string, id: string, role: "user" | "assistant", content: string) {

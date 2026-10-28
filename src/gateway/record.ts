@@ -1,5 +1,5 @@
 import type { Env } from "../types";
-import { upsertMessageFts } from "../memory/fts";
+import { insertMessageFts } from "../memory/fts";
 import { captureRememberNow } from "../memory/rememberNow";
 import { sha256Hex } from "../utils/hash";
 import { getSseData, splitSseEvents } from "../utils/sseParser";
@@ -57,30 +57,29 @@ export async function persistExchange(env: Env, e: GatewayExchange): Promise<voi
     .bind(e.id, e.namespace, e.profile, e.conversationId, e.protocol, e.kind, e.userText, spoken,
       e.model, e.provider, e.httpStatus, e.completion, e.createdAt)];
   // Auxiliary tasks and incomplete outputs never become relationship memories.
+  const added: Array<{ index: number; id: string; content: string }> = [];
   if (e.kind !== "auxiliary") {
     statements.push(env.DB.prepare("INSERT OR IGNORE INTO conversations (id, namespace, created_at, updated_at) VALUES (?, ?, ?, ?)")
       .bind(e.conversationId, e.namespace, e.createdAt, e.createdAt));
-    const addMessage = (id: string, role: string, content: string, seq: number) => statements.push(env.DB.prepare(`INSERT OR IGNORE INTO messages
+    const addMessage = (id: string, role: string, content: string, seq: number) => {
+      added.push({ index: statements.length, id, content });
+      statements.push(env.DB.prepare(`INSERT OR IGNORE INTO messages
       (id, conversation_id, namespace, role, content, source, client_message_hash, upstream_model,
        upstream_provider, request_model, stream, finish_reason, created_at, seq)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .bind(id, e.conversationId, e.namespace, role, content, `gateway:${e.profile}`, id,
         e.model, e.provider, e.profile, e.stream ? 1 : 0, e.completion, e.createdAt, seq));
+    };
     if (e.kind === "human" && e.userText && e.completion !== "truncated") addMessage(e.userId, "user", e.userText, 0);
     if (e.completion === "complete" && spoken) addMessage(`${e.id}:assistant`, "assistant", spoken, 1);
   }
-  await env.DB.batch(statements);
-  if (e.kind !== "auxiliary") {
-    if (e.kind === "human" && e.userText && e.completion !== "truncated") {
-      await upsertMessageFts(env.DB, { namespace: e.namespace, messageId: e.userId, content: e.userText });
-    }
-    if (e.completion === "complete" && spoken) {
-      await upsertMessageFts(env.DB, {
-        namespace: e.namespace,
-        messageId: `${e.id}:assistant`,
-        content: spoken
-      });
-    }
+  const results = await env.DB.batch(statements);
+  // Index only rows this batch actually inserted. An ignored insert means the row (and its
+  // FTS entry) already exists: the user line was usually captured on the request path by
+  // persistHumanUtterance, and queue retries repeat the whole exchange.
+  for (const message of added) {
+    if ((results[message.index]?.meta?.changes ?? 0) === 0) continue;
+    await insertMessageFts(env.DB, { namespace: e.namespace, messageId: message.id, content: message.content });
   }
   if (e.kind === "human" && e.userText && e.completion !== "truncated") {
     try {
@@ -109,7 +108,7 @@ export async function persistHumanUtterance(
   if (e.kind !== "human" || !e.userText || e.completion === "truncated") {
     return { saved: false, indexed: false, remember: { wrote: false } };
   }
-  await env.DB.batch([
+  const [, inserted] = await env.DB.batch([
     env.DB.prepare("INSERT OR IGNORE INTO conversations (id, namespace, created_at, updated_at) VALUES (?, ?, ?, ?)")
       .bind(e.conversationId, e.namespace, e.createdAt, e.createdAt),
     env.DB.prepare(`INSERT OR IGNORE INTO messages
@@ -119,7 +118,8 @@ export async function persistHumanUtterance(
       .bind(e.userId, e.conversationId, e.namespace, "user", e.userText, `gateway:${e.profile}`, e.userId,
         e.model, e.provider, e.profile, e.stream ? 1 : 0, e.completion, e.createdAt, 0)
   ]);
-  const indexed = await upsertMessageFts(env.DB, {
+  // A client retry of the same turn hits the existing row, which is already indexed.
+  const indexed = (inserted?.meta?.changes ?? 0) > 0 && await insertMessageFts(env.DB, {
     namespace: e.namespace,
     messageId: e.userId,
     content: e.userText
