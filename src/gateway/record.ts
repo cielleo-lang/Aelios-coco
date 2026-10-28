@@ -164,6 +164,8 @@ function coerceToolInput(input: unknown): unknown {
 
 export class OutputCollector {
   text = "";
+  /** Every tool call the model made, in order; `text` carries the same lines inline. */
+  tools: Array<{ name: string; line: string }> = [];
   complete = false;
   failed = false;
   truncated = false;
@@ -182,6 +184,7 @@ export class OutputCollector {
   private appendTool(name: string, input: unknown): void {
     const line = formatToolCall(name, input);
     if (!line) return;
+    this.tools.push({ name, line });
     if (this.text && !this.text.endsWith("\n")) this.append("\n");
     this.append(`${line}\n`);
   }
@@ -287,6 +290,7 @@ export class OutputCollector {
         const streamed = this.text;
         this.pending.clear();
         this.text = "";
+        this.tools = [];
         this.json(data.response);
         if (!this.text) this.text = streamed;
       }

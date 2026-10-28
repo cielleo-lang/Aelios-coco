@@ -12,6 +12,7 @@ import { getOrCreateConversation } from "../src/db/conversations";
 import { saveUserMessages } from "../src/db/messages";
 
 import { lexicalOverlapScore, shapeRecallQuery } from "../src/memory/queryShape";
+import { codingClient, codingSpeech, stripCodeBlocks } from "../src/gateway/coding";
 
 // Test production modules and SQL with deterministic HTTP and Workers AI doubles.
 (crypto.subtle as any).timingSafeEqual = (a: Uint8Array, b: Uint8Array) => timingSafeEqual(a, b);
@@ -1380,4 +1381,69 @@ test("the model list marks which models get memory under the asking identity; ot
   // The same list under the other identity, reached by its path with the key it allows.
   assert.deepEqual(await mark("/other/v1/models", { authorization: "Bearer im-key" }), {
     "anthropic/claude-opus-4-5": false, partner: false, "chatgpt/gpt-5": true, "openrouter/openai/gpt-6.1-sol:floor": true, "custom-mine/tiny": false });
+});
+
+test("codingClient knows coding agents by header or by shell plus edit tools", () => {
+  const h = (init: Record<string, string>) => new Headers(init);
+  assert.equal(codingClient(h({ "user-agent": "claude-cli/2.1.0 (external, cli)" }), {}), "client:claude-cli");
+  assert.equal(codingClient(h({ originator: "codex_cli_rs", "user-agent": "codex_cli_rs/0.50.0" }), {}), "client:codex");
+  assert.equal(codingClient(h({ "x-title": "Cline", "http-referer": "https://cline.bot" }), {}), "client:cline");
+  assert.equal(codingClient(h({ "x-title": "Roo Code" }), {}), "client:roo code");
+  assert.equal(codingClient(h({ "user-agent": "opencode/0.15.0" }), {}), "client:opencode");
+  // Messages, Chat Completions and Responses tool shapes, including Anthropic's versioned server tools.
+  assert.equal(codingClient(h({}), { tools: [{ name: "Bash" }, { name: "Read" }, { name: "Edit" }] }), "tools:bash+edit");
+  assert.equal(codingClient(h({}), { tools: [{ type: "bash_20250124", name: "bash" }, { type: "text_editor_20250728", name: "str_replace_based_edit_tool" }] }), "tools:bash+strreplacebasededittool");
+  assert.equal(codingClient(h({}), { tools: [{ type: "function", function: { name: "execute_command" } }, { type: "function", function: { name: "replace_in_file" } }] }), "tools:executecommand+replaceinfile");
+  assert.equal(codingClient(h({}), { tools: [{ type: "local_shell" }, { type: "custom", name: "apply_patch" }] }), "tools:localshell+applypatch");
+  // A companion app: chat UAs, memory and web tools, or only one of the two kinds.
+  assert.equal(codingClient(h({ "user-agent": "Mozilla/5.0 Chatbox/1.15" }), { tools: [{ name: "web_search" }, { name: "memory_recall" }, { name: "write_diary" }] }), null);
+  assert.equal(codingClient(h({ "user-agent": "Anthropic/JS 0.60.0" }), { tools: [{ name: "bash" }, { name: "read" }] }), null);
+  assert.equal(codingClient(h({}), {}), null);
+});
+
+test("coding speech keeps words, turns code blocks into [code] and drops code steps", () => {
+  assert.equal(stripCodeBlocks("改成这样：\n```ts\nconst a = 1;\n```\n好了"), "改成这样：\n[code]\n好了");
+  assert.equal(stripCodeBlocks("先看：\n~~~py\nprint(1)\n没关上"), "先看：\n[code]");
+  assert.equal(stripCodeBlocks("行内 `code` 不动"), "行内 `code` 不动");
+  assert.equal(stripCodeBlocks("```\nonly code\n```"), "");
+  assert.equal(codingSpeech({ text: "Let me read it.\nRead {}", tools: [{ name: "Read", line: "Read {}" }] }), "");
+  assert.equal(codingSpeech({ text: "我去发\nweixin_send {}\nexec {}", tools: [{ name: "weixin_send", line: "weixin_send {\"text\":\"晚安\"}" }, { name: "exec", line: "exec {}" }] }),
+    "weixin_send {\"text\":\"晚安\"}");
+  assert.equal(codingSpeech({ text: "改好了。\n```\nx\n```", tools: [] }), "改好了。\n[code]");
+});
+
+test("coding agents are recorded as conversation only, unless the assistant turns the filter off", async () => {
+  const mock = globalThis.fetch;
+  let reply: any = { content: [{ type: "text", text: "我先看看。" }, { type: "tool_use", id: "r", name: "Read", input: { file_path: "/src/a.ts" } }], stop_reason: "tool_use" };
+  globalThis.fetch = async (url: any, init: any) => {
+    calls.push({ url: String(url), headers: Object.fromEntries(new Headers(init?.headers)), query: JSON.parse(init?.body as string) });
+    return Response.json({ model: "claude-test", ...reply });
+  };
+  const claudeCode = { "user-agent": "claude-cli/2.1.0 (external, cli)" };
+  const ask = { role: "user", content: "老公帮我把按钮改蓝\n```css\n.btn { color: red }\n```" };
+  const step = { role: "assistant", content: reply.content };
+  const result = { role: "user", content: [{ type: "tool_result", tool_use_id: "r", content: ".btn { color: red }" }] };
+  try {
+    // Her turn: recorded without the code, and the reply's file read is not.
+    let out = await run("/v1/messages", { model: "partner", max_tokens: 64, messages: [ask] }, claudeCode);
+    assert.equal(out.response.headers.get("x-aelios-coding"), "client:claude-cli");
+    assert.equal((sqlite.prepare("SELECT content FROM messages WHERE role = 'user'").get() as any).content, "老公帮我把按钮改蓝\n[code]");
+    assert.equal(queue.length, 1); assert.equal(queue[0].assistantText, "");
+    // A step that only edits code: nothing dispatched at all.
+    reply = { content: [{ type: "tool_use", id: "e", name: "Edit", input: { old_string: "red", new_string: "blue" } }], stop_reason: "tool_use" };
+    out = await run("/v1/messages", { model: "partner", max_tokens: 64, messages: [ask, step, result] }, claudeCode);
+    assert.equal(out.response.status, 200);
+    assert.equal(queue.length, 1);
+    // The closing reply is conversation and is kept, code and all turned into [code].
+    reply = { content: [{ type: "text", text: "改好了，现在是蓝色。\n```css\n.btn { color: blue }\n```" }], stop_reason: "end_turn" };
+    await run("/v1/messages", { model: "partner", max_tokens: 64, messages: [ask, step, result] }, claudeCode);
+    assert.equal(queue.length, 2); assert.equal(queue[1].assistantText, "改好了，现在是蓝色。\n[code]");
+    // Filter off: the old behaviour, everything recorded.
+    setConfig(config([{ ...identity(), codingFilter: false } as ReturnType<typeof identity>]));
+    reply = { content: [{ type: "tool_use", id: "e", name: "Edit", input: { old_string: "red", new_string: "blue" } }], stop_reason: "tool_use" };
+    out = await run("/v1/messages", { model: "partner", max_tokens: 64, messages: [ask, step, result] }, claudeCode);
+    assert.equal(out.response.headers.get("x-aelios-coding"), null);
+    assert.equal(queue.length, 3); assert.match(queue[2].assistantText, /Edit/);
+  } finally { globalThis.fetch = mock; }
+  assert.throws(() => validateConfig({ ...config(), identities: [{ ...identity(), codingFilter: "yes" }] }), /codingFilter/);
 });

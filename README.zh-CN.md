@@ -73,6 +73,8 @@ https://<你的 Worker 地址>/coder/v1
 
 主模型才有记忆。没登记的模型（比如 Claude Code 里的小模型）只是路过，不记也不召。
 
+用 Claude Code、Codex、Cline 这类工具写代码时，Aelios 只记说的话：代码块记成 `[code]`，读文件、跑命令、改文件的步骤不记。想全记，在助手的「召回空间、思考块、字数上限、写代码过滤」里关掉「写代码时只记说的话」。
+
 ### 3. 客户端指过来
 
 API Key 一律填 `CHATBOX_API_KEY`。模型名写成 `厂商/模型`，比如 `anthropic/claude-opus-4-5`。

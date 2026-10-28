@@ -10,6 +10,7 @@ import type { Env } from "../types";
 import { newId } from "../utils/ids";
 import { nowIso } from "../utils/time";
 import { cleanMessageText } from "../utils/sanitize";
+import { codingClient, codingSpeech, stripCodeBlocks } from "./coding";
 import { findIdentity, identityNamespace, identityReadNamespaces, isMainModel, loadConfig, type GatewayConfig, type Identity, type Protocol } from "./config";
 import { appendMemory, classifyTurn, hasServerState, inputItems, recentHumanTexts, validateBody, visibleText, type Body } from "./protocol";
 import { RequestContractError } from "./request";
@@ -222,7 +223,10 @@ export async function handleGateway(request: Request, env: Env, ctx: ExecutionCo
   if (protocol === "responses" && main && hasServerState(body, protocol)) {
     return gatewayError(protocol, "Request-only memory requires stateless Responses input: send full history without previous_response_id, conversation or item_reference; or use a model outside the main list.", 400);
   }
-  const turn = classifyTurn(body, protocol, request.headers.get("x-aelios-purpose") === "auxiliary");
+  // Coding agents keep memory of what was said, not of the code (see coding.ts).
+  const coding = main && identity.codingFilter !== false ? codingClient(request.headers, body) : null;
+  const classified = classifyTurn(body, protocol, request.headers.get("x-aelios-purpose") === "auxiliary");
+  const turn = coding && classified.text ? { ...classified, text: stripCodeBlocks(classified.text) } : classified;
   let prepared: PreparedRequest;
   try { prepared = prepareGatewayRequest(env, config, identity, protocol, request, body); }
   catch (error) {
@@ -247,7 +251,8 @@ export async function handleGateway(request: Request, env: Env, ctx: ExecutionCo
   if (main && turn.kind === "human" && turn.text) {
     try {
       const prior = recentHumanTexts(body, protocol).slice(0, -1).slice(-3);
-      patch = await recallPatch(env, identity, turn.text, ctx, prior, {
+      // The [code] placeholders are for the record, not words to search memories with.
+      patch = await recallPatch(env, identity, coding ? turn.text.replaceAll("[code]", " ") : turn.text, ctx, prior, {
         excludeMessageIds: exchange ? [exchange.userId] : [],
         recallId,
         // A quote still present in this request's history is visible; recalling it
@@ -273,6 +278,7 @@ export async function handleGateway(request: Request, env: Env, ctx: ExecutionCo
     headers.set("x-aelios-remember", rememberStatus);
     headers.set("x-aelios-provider", upstream.headers.get("cf-aig-provider") || "");
     headers.set("x-aelios-model", upstream.headers.get("cf-aig-model") || body.model);
+    if (coding) headers.set("x-aelios-coding", coding);
     headers.set("cache-control", "no-store");
     const response = new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers });
     if (!exchange) return response;
@@ -285,11 +291,13 @@ export async function handleGateway(request: Request, env: Env, ctx: ExecutionCo
       return response;
     }
     return observeResponse(response, protocol, ctx, async (out, interrupted) => {
-      exchange.assistantText = out.text;
+      exchange.assistantText = coding ? codingSpeech(out) : out.text;
       if (out.model) exchange.model = out.model;
       exchange.completion = !upstream.ok || out.failed ? "failed" :
         out.truncated || exchange.completion === "truncated" ? "truncated" :
         interrupted || !out.complete ? "incomplete" : "complete";
+      // A coding step that only read, ran or edited code leaves nothing to keep: skip the write.
+      if (coding && exchange.kind !== "human" && !cleanMessageText(exchange.assistantText)) return;
       await dispatchExchange(env, exchange);
     });
   } catch (error) {

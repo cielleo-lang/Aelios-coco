@@ -1600,7 +1600,7 @@ tailwind.config = { corePlugins: { preflight: false } };
                         </div>
                       </div>
                       <details>
-                        <summary class="text-[13px] muted">${t("召回空间、思考块、字数上限", "Recall spaces, thinking blocks, size limit")}</summary>
+                        <summary class="text-[13px] muted">${t("召回空间、思考块、字数上限、写代码过滤", "Recall spaces, thinking blocks, size limit, coding filter")}</summary>
                         <div class="mt-3 grid gap-3">
                           <label class="block"><span class="label">${t("召回空间", "Recall spaces")}</span>
                             <input x-model="idn.readNamespacesText" class="field" :placeholder="L('逗号分隔；留空只读写入空间；[] 不召回', 'Comma-separated; blank = its own space; [] = none')">
@@ -1616,6 +1616,10 @@ tailwind.config = { corePlugins: { preflight: false } };
                           <label class="block"><span class="label">${t("单次记忆字数上限", "Memory characters per turn")}</span>
                             <input x-model="idn.maxMemoryChars" type="number" min="256" max="24000" class="field" :placeholder="L('留空默认 6000', 'Blank: 6000')">
                           </label>
+                          <div>
+                            <label class="check"><input type="checkbox" x-model="idn.codingFilter"><span>${t("写代码时只记说的话（默认开）", "When coding, keep only what was said (on by default)")}</span></label>
+                            <p class="text-xs muted">${t("Claude Code、Codex、Cline 这类写代码的工具发来的请求，代码块记成 [code]，读文件、跑命令、改文件的步骤不记。关掉就全记。", "For requests from coding tools such as Claude Code, Codex and Cline, code blocks are saved as [code], and steps that read, run or edit code are not saved. Turn off to save everything.")}</p>
+                          </div>
                         </div>
                       </details>
                       <div class="flex justify-end"><button type="button" @click="gwIdentities.splice(i, 1)" class="btn btn-sm btn-danger" x-text="L('移除这个助手', 'Remove this assistant')"></button></div>
@@ -2760,6 +2764,7 @@ function memoryAdmin() {
             keys: idn.keys && idn.keys.length ? idn.keys.slice() : ['CHATBOX_API_KEY'],
             anthropicThinking: idn.anthropicThinking || 'auto',
             maxMemoryChars: idn.maxMemoryChars || '',
+            codingFilter: idn.codingFilter !== false,
             _open: false
           };
         });
@@ -2786,7 +2791,7 @@ function memoryAdmin() {
     gwAdd() {
       // 第一个助手默认跟 MCP、Claude Code 钩子用同一个 default 空间，不然先用过 MCP 的人记忆会分成两份。
       const namespace = this.gwIdentities.length ? '' : 'default';
-      this.gwIdentities.push({ slug: '', userName: '', assistantName: '', modelsText: '', namespace: namespace, readNamespacesText: '', keys: ['CHATBOX_API_KEY'], anthropicThinking: 'auto', maxMemoryChars: '', _open: true });
+      this.gwIdentities.push({ slug: '', userName: '', assistantName: '', modelsText: '', namespace: namespace, readNamespacesText: '', keys: ['CHATBOX_API_KEY'], anthropicThinking: 'auto', maxMemoryChars: '', codingFilter: true, _open: true });
     },
     // 助手和上游要一起改好再存，所以跟线上比一比，有没存的就在底部浮出保存条。
     gwMark() { this.gwSnapshot = JSON.stringify(this.gwPayload()); },
@@ -2810,6 +2815,7 @@ function memoryAdmin() {
         if (idn.anthropicThinking && idn.anthropicThinking !== 'auto') out.anthropicThinking = idn.anthropicThinking;
         const budget = parseInt(idn.maxMemoryChars, 10);
         if (budget) out.maxMemoryChars = budget;
+        if (!idn.codingFilter) out.codingFilter = false;
         return out;
       });
       return { identities: identities, upstream: this.gwAddress.trim() ? { address: this.gwAddress.trim() } : null };
