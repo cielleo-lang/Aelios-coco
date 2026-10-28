@@ -54,15 +54,20 @@ export async function deleteFtsRow(
   }
 }
 
-export async function upsertMessageFts(
+// message_id / memory_id are UNINDEXED in FTS5, so `DELETE ... WHERE message_id = ?` reads
+// every row of the FTS table (D1 bills each one). Upsert only when the row may already be
+// indexed; a row that was just inserted, or that backfill just found missing, uses the
+// insert-only variant and reads nothing.
+async function writeMessageFts(
   db: D1Database,
-  input: { namespace: string; messageId: string; content: string }
+  input: { namespace: string; messageId: string; content: string },
+  replace: boolean
 ): Promise<boolean> {
   const body = toFtsBody(cleanMessageText(input.content));
   if (!body) return false;
   try {
     await withRetry(async () => {
-      await db.prepare("DELETE FROM message_fts WHERE message_id = ?").bind(input.messageId).run();
+      if (replace) await db.prepare("DELETE FROM message_fts WHERE message_id = ?").bind(input.messageId).run();
       await db
         .prepare("INSERT INTO message_fts (fts_body, namespace, message_id) VALUES (?, ?, ?)")
         .bind(body, input.namespace, input.messageId)
@@ -75,15 +80,32 @@ export async function upsertMessageFts(
   }
 }
 
-export async function upsertMemoryFts(
+/** Re-index a message that may already have an FTS row. Scans the whole FTS table. */
+export function upsertMessageFts(
   db: D1Database,
-  input: { namespace: string; memoryId: string; content: string }
+  input: { namespace: string; messageId: string; content: string }
+): Promise<boolean> {
+  return writeMessageFts(db, input, true);
+}
+
+/** Index a message row that has no FTS row yet (just inserted, or found missing by backfill). */
+export function insertMessageFts(
+  db: D1Database,
+  input: { namespace: string; messageId: string; content: string }
+): Promise<boolean> {
+  return writeMessageFts(db, input, false);
+}
+
+async function writeMemoryFts(
+  db: D1Database,
+  input: { namespace: string; memoryId: string; content: string },
+  replace: boolean
 ): Promise<boolean> {
   const body = toFtsBody(input.content);
   if (!body) return false;
   try {
     await withRetry(async () => {
-      await db.prepare("DELETE FROM memory_fts WHERE memory_id = ?").bind(input.memoryId).run();
+      if (replace) await db.prepare("DELETE FROM memory_fts WHERE memory_id = ?").bind(input.memoryId).run();
       await db
         .prepare("INSERT INTO memory_fts (fts_body, namespace, memory_id) VALUES (?, ?, ?)")
         .bind(body, input.namespace, input.memoryId)
@@ -94,6 +116,14 @@ export async function upsertMemoryFts(
     if (!isMissingFtsError(error)) console.error("memory fts index failed", { id: input.memoryId, error });
     return false;
   }
+}
+
+/** Re-index a memory that may already have an FTS row. Scans the whole FTS table. */
+export function upsertMemoryFts(
+  db: D1Database,
+  input: { namespace: string; memoryId: string; content: string }
+): Promise<boolean> {
+  return writeMemoryFts(db, input, true);
 }
 
 export async function searchFtsIds(
@@ -147,17 +177,18 @@ async function indexMissingMessages(
   input: { namespace?: string; limit: number }
 ): Promise<{ indexed: number; failed: number }> {
   const scoped = Boolean(input.namespace);
+  // NOT IN reads the FTS table once into a temporary index. The old LEFT JOIN probed the
+  // FTS table (no index on message_id) once per message: messages × FTS rows, every night.
   const sql = scoped
     ? `SELECT m.id, m.namespace, m.content
        FROM messages m
-       LEFT JOIN message_fts f ON f.message_id = m.id
-       WHERE m.namespace = ? AND f.message_id IS NULL
-         AND m.role IN ('user', 'assistant')
+       WHERE m.namespace = ? AND m.role IN ('user', 'assistant')
+         AND m.id NOT IN (SELECT message_id FROM message_fts WHERE message_id IS NOT NULL)
        LIMIT ?`
     : `SELECT m.id, m.namespace, m.content
        FROM messages m
-       LEFT JOIN message_fts f ON f.message_id = m.id
-       WHERE f.message_id IS NULL AND m.role IN ('user', 'assistant')
+       WHERE m.role IN ('user', 'assistant')
+         AND m.id NOT IN (SELECT message_id FROM message_fts WHERE message_id IS NOT NULL)
        LIMIT ?`;
   const result = scoped
     ? await db.prepare(sql).bind(input.namespace, input.limit).all<{ id: string; namespace: string; content: string }>()
@@ -166,7 +197,7 @@ async function indexMissingMessages(
   let indexed = 0;
   let failed = 0;
   for (const row of result.results ?? []) {
-    const ok = await upsertMessageFts(db, { namespace: row.namespace, messageId: row.id, content: row.content });
+    const ok = await insertMessageFts(db, { namespace: row.namespace, messageId: row.id, content: row.content });
     if (ok) indexed += 1;
     else failed += 1;
   }
@@ -181,14 +212,13 @@ async function indexMissingMemories(
   const sql = scoped
     ? `SELECT m.id, m.namespace, m.content, m.summary
        FROM memories m
-       LEFT JOIN memory_fts f ON f.memory_id = m.id
-       WHERE m.namespace = ? AND f.memory_id IS NULL
-         AND m.status = 'active'
+       WHERE m.namespace = ? AND m.status = 'active'
+         AND m.id NOT IN (SELECT memory_id FROM memory_fts WHERE memory_id IS NOT NULL)
        LIMIT ?`
     : `SELECT m.id, m.namespace, m.content, m.summary
        FROM memories m
-       LEFT JOIN memory_fts f ON f.memory_id = m.id
-       WHERE f.memory_id IS NULL AND m.status = 'active'
+       WHERE m.status = 'active'
+         AND m.id NOT IN (SELECT memory_id FROM memory_fts WHERE memory_id IS NOT NULL)
        LIMIT ?`;
   const result = scoped
     ? await db.prepare(sql).bind(input.namespace, input.limit).all<{ id: string; namespace: string; content: string; summary: string | null }>()
@@ -197,11 +227,11 @@ async function indexMissingMemories(
   let indexed = 0;
   let failed = 0;
   for (const row of result.results ?? []) {
-    const ok = await upsertMemoryFts(db, {
+    const ok = await writeMemoryFts(db, {
       namespace: row.namespace,
       memoryId: row.id,
       content: `${row.content}\n${row.summary ?? ""}`
-    });
+    }, false);
     if (ok) indexed += 1;
     else failed += 1;
   }

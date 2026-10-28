@@ -1,4 +1,4 @@
-import { upsertMessageFts } from "../memory/fts";
+import { insertMessageFts } from "../memory/fts";
 import type { MessageRecord, OpenAIChatMessage, TokenUsage } from "../types";
 import { sha256Hex } from "../utils/hash";
 import { newId } from "../utils/ids";
@@ -84,6 +84,7 @@ export async function saveUserMessages(
       .run();
 
     // Duplicate hash (client retry): return the existing row id so callers still get a valid message id.
+    // That row was indexed when it was first saved, so only a fresh row needs an FTS entry.
     if ((result.meta.changes ?? 0) === 0) {
       const existing = await db
         .prepare("SELECT id FROM messages WHERE client_message_hash = ? LIMIT 1")
@@ -92,8 +93,8 @@ export async function saveUserMessages(
       ids.push(existing?.id ?? id);
     } else {
       ids.push(id);
+      await insertMessageFts(db, { namespace: input.namespace, messageId: id, content });
     }
-    await upsertMessageFts(db, { namespace: input.namespace, messageId: ids[ids.length - 1], content });
   }
 
   return ids;
@@ -153,7 +154,7 @@ export async function saveAssistantMessage(
     )
     .run();
 
-  await upsertMessageFts(db, { namespace: input.namespace, messageId: id, content: input.content });
+  await insertMessageFts(db, { namespace: input.namespace, messageId: id, content: input.content });
   return id;
 }
 
@@ -336,7 +337,7 @@ export async function saveIngestMessages(
         seq
       )
       .run();
-    await upsertMessageFts(db, { namespace: input.namespace, messageId: id, content });
+    await insertMessageFts(db, { namespace: input.namespace, messageId: id, content });
     seq += 1;
   }
 
