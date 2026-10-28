@@ -6,12 +6,14 @@ import type { Body } from "./protocol";
  * Each tool step is its own request, and what it carries is about the code, not the relationship.
  * So for a coding request the gateway records:
  *  - the person's words with code blocks replaced by [code];
- *  - a reply that called no work tool, with code blocks replaced the same way;
+ *  - a reply that called no work tool, with code blocks replaced the same way as the text streams in,
+ *    so a long block never fills the 8,000-character cap before the words after it;
  *  - from a step that called a work tool, only its speech tool calls (a message sent through a
- *    tool). Work tools are every tool that is not speech, so tool names nobody listed stay out.
- *    Their arguments never enter the record, so they cannot crowd out or outgrow the 8,000-character
- *    cap. A finished step left with nothing is not recorded at all, so it costs no D1 writes; a
- *    failed one is still recorded as failed.
+ *    tool), with code in what they say replaced too. A speech tool's name is made only of the words
+ *    below; every other tool is work, so tool names nobody listed stay out. Work tool arguments never
+ *    enter the record, so they cannot crowd out or outgrow the cap. A finished step left with nothing
+ *    writes no new rows (it only closes an earlier failed try of the same request); a failed one is
+ *    still recorded as failed.
  * Recall still runs on the person's turns only, and searches without the code.
  * An assistant can switch this off with `codingFilter: false` to record everything as before.
  *
@@ -29,11 +31,15 @@ const SHELL_TOOLS = new Set(["bash", "shell", "localshell", "executecommand", "r
 const EDIT_TOOLS = new Set(["edit", "multiedit", "write", "applypatch", "strreplaceeditor", "strreplacebasededittool",
   "texteditor", "writetofile", "replaceinfile", "editfile", "applydiff", "createfile", "insertcontent",
   "searchandreplace", "notebookedit", "writefile", "patch"]);
-// A speech tool says something to someone: its name has one of these words and none of the second set
-// ("sendKeys" types into a terminal, "commit_message" writes to git).
-const SPEECH_WORDS = new Set(["send", "reply", "message", "messages", "msg", "notify", "speak", "say", "voice", "tts", "sticker", "dm"]);
-const NOT_SPEECH_WORDS = new Set(["key", "keys", "terminal", "shell", "bash", "exec", "command", "file", "files", "commit",
-  "log", "logs", "code", "pr", "pull", "issue", "input"]);
+// A speech tool says something to someone: its name has one of these words, and every other word is
+// one of the second set (who or where it goes). "send_patch", "sendKeys" and "commit_message" are work.
+const SPEECH_WORDS = new Set(["send", "reply", "respond", "message", "messages", "msg", "notify", "notification",
+  "speak", "say", "tell", "talk", "voice", "tts", "sticker", "dm"]);
+const SPEECH_CONTEXT = new Set(["to", "the", "a", "user", "owner", "human", "her", "him", "them", "text", "chat", "im",
+  "private", "group", "channel", "room", "friend", "contact", "partner", "wife", "husband", "audio", "image", "photo",
+  "picture", "emoji", "reaction", "react", "card", "push", "bot", "final", "proactive", "weixin", "wechat", "wx",
+  "telegram", "tg", "qq", "discord", "slack", "line", "whatsapp", "signal", "imessage", "sms", "feishu", "lark",
+  "dingtalk", "kook", "matrix", "email", "mail", "onebot", "napcat"]);
 
 function normalize(name: unknown): string {
   return typeof name === "string" ? name.toLowerCase().replace(/[^a-z0-9]/g, "").replace(/\d+$/, "") : "";
@@ -57,21 +63,105 @@ export function codingClient(headers: Headers, body: Body): string | null {
   return shell && edit ? `tools:${shell}+${edit}` : null;
 }
 
+/** Whether a tool call says something to someone (see the header). MCP server names are not judged. */
 export function isSpeechTool(name: string): boolean {
-  const words = name.replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-  return words.some(word => SPEECH_WORDS.has(word)) && !words.some(word => NOT_SPEECH_WORDS.has(word));
+  const tool = /^mcp__/i.test(name) ? name.slice(name.lastIndexOf("__") + 2) : name;
+  const words = tool.replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().split(/[^a-z0-9]+/)
+    .filter(word => word && !/^v?\d+$/.test(word));
+  return words.some(word => SPEECH_WORDS.has(word)) &&
+    words.every(word => SPEECH_WORDS.has(word) || SPEECH_CONTEXT.has(word));
 }
 
 /**
- * Fenced code blocks become [code]; code alone leaves "". As in CommonMark, a block closes at a line
- * of the same fence character at least as long as the opening one, or runs to the end.
+ * Turns fenced code blocks into [code] as text streams through, keeping only a few characters of
+ * the current line. As in CommonMark, a block opens at a line of three or more ` or ~ and closes at
+ * a line of the same character at least as long, or runs to the end.
  */
+export class CodeFilter {
+  private head = "";
+  private line: "open" | "text" | "drop" | null = null;
+  private fence: { char: string; length: number } | null = null;
+  constructor(private readonly emit: (text: string) => void) {}
+
+  push(text: string): void {
+    let start = 0;
+    for (let nl = text.indexOf("\n"); nl >= 0; nl = text.indexOf("\n", start)) {
+      this.feed(text.slice(start, nl));
+      this.endLine(true);
+      start = nl + 1;
+    }
+    this.feed(text.slice(start));
+  }
+
+  /** The text ends here, or a tool call comes next: an open block ends with it. */
+  end(): void {
+    this.endLine(false);
+    this.fence = null;
+  }
+
+  private feed(piece: string): void {
+    if (!piece || this.line === "open" || this.line === "drop") return;
+    if (this.line === "text") { this.emit(piece); return; }
+    this.head += piece;
+    const rest = this.head.replace(/^[ \t]*/, "");
+    const run = /^(`+|~+)/.exec(rest)?.[0] || "";
+    if (this.fence) {
+      // Inside a block nothing is kept; a line is held only while it could still close the block.
+      const closing = run.startsWith(this.fence.char) || !rest;
+      if (!closing || rest.slice(run.length).trim() || this.head.length > 256) { this.line = "drop"; this.head = ""; }
+    } else if (rest.length > run.length || this.head.length > 256) {
+      // The run of fence characters has ended: three or more open a block, fewer are words.
+      if (run.length >= 3) this.open(run);
+      else { this.line = "text"; this.emit(this.head); this.head = ""; }
+    }
+  }
+
+  private open(run: string): void {
+    this.fence = { char: run[0], length: run.length };
+    this.line = "open"; this.head = "";
+    this.emit("[code]");
+  }
+
+  private endLine(newline: boolean): void {
+    if (this.fence) {
+      // A held line is fence characters and spaces only: it closes if the run is long enough.
+      if (this.line === null && this.head.trim().length >= this.fence.length) {
+        this.fence = null;
+        if (newline) this.emit("\n");
+      }
+    } else if (this.line === "text") {
+      if (newline) this.emit("\n");
+    } else if (this.line === null) {
+      const run = /^(`{3,}|~{3,})$/.exec(this.head.trim())?.[0];
+      if (run) this.open(run);
+      else if (this.head || newline) this.emit(newline ? `${this.head}\n` : this.head);
+    }
+    this.head = "";
+    this.line = null;
+  }
+}
+
+/** Fenced code blocks become [code]. */
+export function replaceCode(text: string): string {
+  let out = "";
+  const filter = new CodeFilter(piece => { out += piece; });
+  filter.push(text);
+  filter.end();
+  return out.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/** Fenced code blocks become [code]; code alone leaves "". */
 export function stripCodeBlocks(text: string): string {
-  const said = text
-    .replace(/(^|\n)[ \t]*((`|~)\3{2,})[^\n]*(?:(?:\n[\s\S]*?)?\n[ \t]*\2\3*[ \t]*(?=\n|$)|[\s\S]*$)/g, "$1[code]")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  const said = replaceCode(text);
   return said.replaceAll("[code]", "").trim() ? said : "";
+}
+
+/** A tool call's arguments with code in every string replaced by [code]. */
+export function replaceCodeIn(value: unknown): unknown {
+  if (typeof value === "string") return replaceCode(value);
+  if (Array.isArray(value)) return value.map(replaceCodeIn);
+  if (object(value)) return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, replaceCodeIn(item)]));
+  return value;
 }
 
 /** The words to search memories with: no code, no placeholders. */

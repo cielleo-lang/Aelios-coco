@@ -1416,9 +1416,9 @@ test("coding speech keeps words, turns code blocks into [code] and drops code st
   assert.equal(said([{ type: "text", text: "我去发" }, { type: "tool_use", name: "weixin_send", input: { text: "晚安" } },
     { type: "tool_use", name: "exec", input: { command: "ls" } }]), "weixin_send {\"text\":\"晚安\"}");
   assert.equal(said([{ type: "text", text: "改好了。\n```\nx\n```" }]), "改好了。\n[code]");
-  // Speech is a word in the name, and words about terminals, files or git rule it out.
-  for (const name of ["weixin_send", "send_message", "sendMessage", "reply", "tts_speak", "send_sticker"]) assert.ok(isSpeechTool(name), name);
-  for (const name of ["sendKeys", "commit_message", "Read", "mcp__github__create_pull_request", "log_message", "send_file"]) assert.ok(!isSpeechTool(name), name);
+  // A speech tool's name is speech words and where they go, nothing else; MCP server names are not judged.
+  for (const name of ["weixin_send", "send_message", "sendMessage", "reply", "tts_speak", "send_sticker", "mcp__weixin__send_message", "send_message_v2"]) assert.ok(isSpeechTool(name), name);
+  for (const name of ["sendKeys", "commit_message", "Read", "mcp__github__create_pull_request", "log_message", "send_file", "send_patch", "AskUserQuestion"]) assert.ok(!isSpeechTool(name), name);
 });
 
 test("coding agents are recorded as conversation only, unless the assistant turns the filter off", async () => {
@@ -1485,11 +1485,53 @@ test("coding filter: code tool arguments neither crowd out nor smuggle in what i
     // Tool names nobody listed are not speech either.
     reply = { content: [{ type: "text", text: "我开个 PR。" }, { type: "tool_use", id: "g", name: "mcp__github__create_pull_request", input: { body: "diff --git a/x b/x" } }], stop_reason: "tool_use" };
     assert.equal(await step(3), null);
-    // A failed step is still recorded as failed, for diagnosis.
+    // A failed step is still recorded as failed, for diagnosis, and its retry closes it.
+    const status = () => (sqlite.prepare("SELECT completion_status AS s FROM gateway_exchanges WHERE profile = 'partner' ORDER BY created_at DESC LIMIT 1").get() as any)?.s;
     reply = () => Response.json({ type: "error", error: { type: "api_error", message: "boom" } }, { status: 500 });
-    kept = await step(4);
-    assert.equal(kept?.completion, "failed");
+    assert.equal(await step(4), null);
+    assert.equal(status(), "failed");
+    reply = { content: [{ type: "tool_use", id: "r", name: "Read", input: {} }], stop_reason: "tool_use" };
+    assert.equal(await step(4), null);
+    assert.equal(status(), "complete"); assert.equal(count("gateway_exchanges"), 1);
+    // A long code block does not push the words after it out of the cap.
+    reply = { content: [{ type: "text", text: `改好了：\n\`\`\`ts\n${"x".repeat(9000)}\n\`\`\`\nDone` }], stop_reason: "end_turn" };
+    kept = await step(5);
+    assert.ok(kept); assert.equal(kept.completion, "complete"); assert.equal(kept.assistantText, "改好了：\n[code]\nDone");
+    // Speech tools are names made only of speech words, and code inside what they say becomes [code].
+    reply = { content: [{ type: "tool_use", id: "p", name: "send_patch", input: { patch: "diff --git a/x b/x" } },
+      { type: "tool_use", id: "r", name: "Read", input: {} }], stop_reason: "tool_use" };
+    assert.equal(await step(6), null);
+    reply = { content: [{ type: "tool_use", id: "m", name: "mcp__weixin__send_message", input: { text: "看这个\n```js\nconst a = 1\n```\n好吧" } },
+      { type: "tool_use", id: "r", name: "Read", input: {} }], stop_reason: "tool_use" };
+    kept = await step(7);
+    assert.ok(kept); assert.match(kept.assistantText, /\[code\]/); assert.doesNotMatch(kept.assistantText, /const a/);
   } finally { globalThis.fetch = mock; }
+});
+
+test("coding filter: streamed code is dropped as it arrives, and streamed tool arguments are bounded", () => {
+  const sse = (events: unknown[]) => new TextEncoder().encode(events.map(e => `data: ${JSON.stringify(e)}\n\n`).join(""));
+  const text = (t: string) => ({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: t } });
+  const out = new OutputCollector("messages", true);
+  out.chunk(sse([{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }, text("看：\n`"), text("``t"), text("s\n")]));
+  for (let i = 0; i < 20; i++) out.chunk(sse([text("y".repeat(1000))]));
+  out.chunk(sse([text("\n``"), text("`\n好了"), { type: "message_delta", delta: { stop_reason: "end_turn" } }, { type: "message_stop" }]));
+  out.finish();
+  assert.deepEqual(codingSpeech(out), { text: "看：\n[code]\n好了", truncated: false });
+  // A huge streamed edit is not held in memory, and does not mark a coding step cut off.
+  const big = new OutputCollector("messages", true);
+  big.chunk(sse([{ type: "content_block_start", index: 1, content_block: { type: "tool_use", name: "Write" } }]));
+  for (let i = 0; i < 100; i++) big.chunk(sse([{ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "z".repeat(1000) } }]));
+  assert.ok((big as any).pending.get(1).json.length <= 64000);
+  big.chunk(sse([{ type: "content_block_stop", index: 1 }, { type: "message_stop" }]));
+  big.finish();
+  assert.deepEqual(codingSpeech(big), { text: "", truncated: false });
+  // Outside coding mode the same call is kept up to the cap and marked cut off.
+  const plain = new OutputCollector("messages");
+  plain.chunk(sse([{ type: "content_block_start", index: 1, content_block: { type: "tool_use", name: "Write" } }]));
+  for (let i = 0; i < 100; i++) plain.chunk(sse([{ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "z".repeat(1000) } }]));
+  plain.chunk(sse([{ type: "content_block_stop", index: 1 }, { type: "message_stop" }]));
+  plain.finish();
+  assert.ok(plain.truncated); assert.ok(plain.text.length <= 8000);
 });
 
 test("coding filter: a longer closing fence ends the block, and earlier code stays out of recall", async () => {

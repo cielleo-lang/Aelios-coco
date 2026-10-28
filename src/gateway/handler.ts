@@ -14,7 +14,7 @@ import { codingClient, codingSpeech, recallWords, stripCodeBlocks } from "./codi
 import { findIdentity, identityNamespace, identityReadNamespaces, isMainModel, loadConfig, type GatewayConfig, type Identity, type Protocol } from "./config";
 import { appendMemory, classifyTurn, hasServerState, inputItems, recentHumanTexts, validateBody, visibleText, type Body } from "./protocol";
 import { RequestContractError } from "./request";
-import { dispatchExchange, persistHumanUtterance, observeResponse, prepareExchange } from "./record";
+import { dispatchExchange, persistExchange, persistHumanUtterance, observeResponse, prepareExchange, settleExchange, type GatewayExchange } from "./record";
 import { callGatewayUpstream, prepareGatewayRequest, UpstreamRouteError, type PreparedRequest } from "./upstream";
 
 export function gatewayError(protocol: Protocol, message: string, status: number): Response {
@@ -202,6 +202,20 @@ export async function recallPatch(
   );
   return assembled.text;
 }
+/**
+ * A coding step that only worked on code leaves nothing to keep. Finished, it adds no rows and only
+ * closes an earlier failed try of the same request; failed or cut off, it is written at once instead
+ * of queued, so that a quick retry finds the row to close.
+ */
+async function recordExchange(env: Env, exchange: GatewayExchange, coding: boolean): Promise<void> {
+  if (coding && exchange.kind !== "human" && !cleanMessageText(exchange.assistantText)) {
+    if (exchange.completion === "complete") await settleExchange(env, exchange);
+    else await persistExchange(env, exchange);
+    return;
+  }
+  await dispatchExchange(env, exchange);
+}
+
 export async function handleGateway(request: Request, env: Env, ctx: ExecutionContext,
   protocol: Protocol, slug: string | null = null): Promise<Response> {
   const auth = await authenticate(request, env);
@@ -288,7 +302,7 @@ export async function handleGateway(request: Request, env: Env, ctx: ExecutionCo
     exchange.provider = headers.get("x-aelios-provider")!;
     if (!response.body) {
       exchange.completion = "failed";
-      ctx.waitUntil(dispatchExchange(env, exchange).catch(() => console.error("gateway exchange recording failed")));
+      ctx.waitUntil(recordExchange(env, exchange, Boolean(coding)).catch(() => console.error("gateway exchange recording failed")));
       return response;
     }
     return observeResponse(response, protocol, ctx, async (out, interrupted) => {
@@ -298,18 +312,14 @@ export async function handleGateway(request: Request, env: Env, ctx: ExecutionCo
       exchange.completion = !upstream.ok || out.failed ? "failed" :
         said.truncated || exchange.completion === "truncated" ? "truncated" :
         interrupted || !out.complete ? "incomplete" : "complete";
-      // A finished coding step that only worked on code leaves nothing to keep: skip the write.
-      // Failed, cut-off and interrupted steps are still recorded with their status.
-      if (coding && exchange.kind !== "human" && exchange.completion === "complete" &&
-          !cleanMessageText(exchange.assistantText)) return;
-      await dispatchExchange(env, exchange);
+      await recordExchange(env, exchange, Boolean(coding));
     }, Boolean(coding));
   } catch (error) {
     console.error("gateway upstream error", error);
     if (exchange) {
       exchange.completion = "failed";
       exchange.httpStatus = 502;
-      ctx.waitUntil(dispatchExchange(env, exchange).catch(() => console.error("gateway exchange recording failed")));
+      ctx.waitUntil(recordExchange(env, exchange, Boolean(coding)).catch(() => console.error("gateway exchange recording failed")));
     }
     return gatewayError(protocol, `Upstream request failed: ${error instanceof Error ? error.message : String(error)}`,
       error instanceof UpstreamRouteError || error instanceof RequestContractError ? error.status : 502);
