@@ -1,4 +1,4 @@
-name = "companion-memory-proxy"
+name = "aelios-coco"
 main = "src/index.ts"
 compatibility_date = "2026-04-01"
 keep_vars = true
@@ -59,7 +59,7 @@ MEMORY_AUTHORED_BOOST = "1.15"
 # 设 "true" 恢复旧的一条龙 (生成+落库+删日志，链上无人)。
 WEEKLY_ROLLUP_DELETE_DAILIES = "false"
 MEMORY_RERANKER_MODEL = "workers-ai/@cf/baai/bge-reranker-base"
-VECTORIZE_INDEX_NAME = "memo-kb"
+VECTORIZE_INDEX_NAME = "memo-kb-coco"
 EMBEDDING_MODEL = "workers-ai/@cf/baai/bge-m3"
 EMBEDDING_DIMENSIONS = "1024"
 # messages 表保留天数；后台 retention 按 namespace 24h 节流清理。
@@ -81,14 +81,14 @@ DREAM_MAX_TOKENS = "8000"
 
 [[vectorize]]
 binding = "VECTORIZE"
-index_name = "memo-kb"
+index_name = "memo-kb-coco"
 
 [[queues.producers]]
 binding = "MEMORY_QUEUE"
-queue = "companion-memory"
+queue = "companion-memory-coco"
 
 [[queues.consumers]]
-queue = "companion-memory"
+queue = "companion-memory-coco"
 # Dream is a long-running job: do not share one invocation's time budget across several dreams.
 max_batch_size = 1
 max_batch_timeout = 30
@@ -97,4 +97,4 @@ max_batch_timeout = 30
 # `npm run deploy` 里的 setup 脚本会在部署时回填真实 ID（只落在构建环境，不进 git）。
 [[d1_databases]]
 binding = "DB"
-database_name = "companion_memory_proxy"
+database_name = "aelios_coco"
